@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Sabbia · Powy ⚡</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E⚡%3C/text%3E%3C/svg%3E">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #e8e6e1; overflow: hidden; }
+  body { font: 13px/1.4 ui-monospace, Menlo, monospace; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; image-rendering: pixelated; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: .9rem; align-items: center; justify-content: center; flex-wrap: wrap;
+         padding: .7rem 1rem calc(.7rem + env(safe-area-inset-bottom)); color: #8a8580; pointer-events: none; text-shadow: 0 0 6px #000, 0 0 2px #000; }
+  .bar > * { pointer-events: auto; }
+  .bar a, .bar button { color: #8a8580; text-decoration: none; background: none; border: 0; font: inherit; padding: 0; cursor: pointer; }
+  .bar button:hover, .bar a:hover { color: #e8e6e1; }
+  #status { min-width: 9em; color: #e8e6e1; text-align: center; }
+  .hint { position: fixed; top: calc(.8rem + env(safe-area-inset-top)); left: 0; right: 0; text-align: center; color: #6b6762; pointer-events: none; transition: opacity 1.5s; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hint" id="hint">tocca per versare sabbia</div>
+<div class="bar">
+  <button id="identity" title="l'elemento neutro del gruppo della sabbia su questa griglia">identità</button>
+  <button id="pile" title="tutti i granelli in un punto, griglia vuota">pila</button>
+  <span id="status"></span>
+  <a href="https://github.com/PowyBot/sabbia">sorgente</a>
+  <a href="/">powy</a>
+</div>
+<script>
+'use strict';
+// Abelian sandpile (Bak, Tang, Wiesenfeld 1987, https://doi.org/10.1103/PhysRevLett.59.381):
+// a cell holding 4 or more grains topples, giving one grain to each neighbor; grains that fall
+// off the border are lost. The final configuration does not depend on the toppling order.
+// The recurrent configurations form a group (Dhar 1990, https://doi.org/10.1103/PhysRevLett.64.1613)
+// whose neutral element, on a rectangle, is the fractal this page draws first. It is computed
+// as stab(6 - stab(6)), where 6 means six grains on every cell: 6 - stab(6) is a sum of
+// toppling moves away from the empty grid, so it is in the identity's class, and it holds at
+// least 3 grains everywhere, so its stabilization is recurrent. Each class has exactly one
+// recurrent configuration.
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const statusLabel = document.getElementById('status');
+const hint = document.getElementById('hint');
+
+// Cell count cap: identity on N cells costs ~N^2/5 sweeps of N cells, so 60k cells is about
+// two seconds on a laptop and still watchable on a phone.
+const MAX_CELLS = 60000;
+// Compute share of each frame. Slow frames (background or headless browsers draw a few per
+// second) get a bigger slice, so the avalanche keeps its pace in time instead of in frames.
+const FRAME_SHARE = 0.7;
+const MIN_BUDGET_MS = 12, MAX_BUDGET_MS = 200;
+const GRAINS_PER_TAP = 4000;
+// A settled pile covers about n / 2.1 cells (mean height ~2.1), a disc; keep it inside the grid.
+const PILE_FILL = 0.9;
+
+// Index 0..3 are stable heights; 4 is "about to topple", drawn as the avalanche front.
+const PALETTE = [[0, 0, 0], [58, 21, 18], [255, 59, 42], [232, 230, 225], [255, 214, 120]];
+
+const params = new URLSearchParams(location.search);
+
+let lastFrameAt = 0;
+let W, H, heights, image, pixels, afterStable = null, sweeps = 0, topples = 0, startedAt = 0, label = '';
+
+function fitGrid() {
+  const cssW = innerWidth, cssH = innerHeight;
+  const forced = /^(\d+)x(\d+)$/.exec(params.get('g') || '');
+  if (forced) {
+    W = +forced[1]; H = +forced[2];
+  } else {
+    const cell = Math.max(1, Math.sqrt(cssW * cssH / MAX_CELLS));
+    W = Math.max(8, Math.floor(cssW / cell));
+    H = Math.max(8, Math.floor(cssH / cell));
+  }
+  canvas.width = W; canvas.height = H;
+  heights = new Int32Array(W * H);
+  image = ctx.createImageData(W, H);
+  pixels = image.data;
+  for (let i = 3; i < pixels.length; i += 4) pixels[i] = 255;
+}
+
+// One Gauss-Seidel style sweep: each unstable cell topples as many times as it can at once,
+// which is what makes a pile of 2^16 grains settle in seconds instead of minutes.
+function sweep() {
+  let toppled = 0;
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    for (let x = 0; x < W; x++) {
+      const i = row + x;
+      const q = heights[i] >> 2;
+      if (q === 0) continue;
+      toppled += q;
+      heights[i] -= q << 2;
+      if (x > 0) heights[i - 1] += q;
+      if (x < W - 1) heights[i + 1] += q;
+      if (y > 0) heights[i - W] += q;
+      if (y < H - 1) heights[i + W] += q;
+    }
+  }
+  return toppled;
+}
+
+function draw() {
+  for (let i = 0, p = 0; i < heights.length; i++, p += 4) {
+    const c = PALETTE[heights[i] < 4 ? heights[i] : 4];
+    pixels[p] = c[0]; pixels[p + 1] = c[1]; pixels[p + 2] = c[2];
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+function run(name, then) {
+  label = name;
+  afterStable = then;
+  sweeps = 0; topples = 0; startedAt = performance.now();
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const sinceLast = now - lastFrameAt;
+  lastFrameAt = now;
+  if (label === '') return;
+  const budget = Math.min(MAX_BUDGET_MS, Math.max(MIN_BUDGET_MS, sinceLast * FRAME_SHARE));
+  const deadline = performance.now() + budget;
+  let toppled = 1;
+  while (toppled > 0 && performance.now() < deadline) {
+    toppled = sweep();
+    topples += toppled;
+    sweeps++;
+  }
+  draw();
+  if (toppled > 0) {
+    statusLabel.textContent = `${label} · ${formatCount(topples)} crolli`;
+    return;
+  }
+  const seconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+  statusLabel.textContent = `${formatCount(topples)} crolli · ${seconds} s`;
+  label = '';
+  const next = afterStable;
+  afterStable = null;
+  if (next) next();
+}
+
+function formatCount(n) {
+  if (n < 1e4) return String(n);
+  if (n < 1e6) return (n / 1e3).toFixed(0) + 'k';
+  return (n / 1e6).toFixed(1) + 'M';
+}
+
+function startIdentity() {
+  heights.fill(6);
+  run('stab(6)', () => {
+    for (let i = 0; i < heights.length; i++) heights[i] = 6 - heights[i];
+    run('stab(6 − stab(6))', null);
+  });
+}
+
+function pileGrains() {
+  const diameter = PILE_FILL * Math.min(W, H);
+  const fits = 2.1 * Math.PI * diameter * diameter / 4;
+  return 2 ** Math.floor(Math.log2(fits));
+}
+
+function startPile() {
+  const grains = pileGrains();
+  heights.fill(0);
+  heights[(H >> 1) * W + (W >> 1)] = grains;
+  run(`${grains} granelli`, null);
+}
+
+function pour(ev) {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.min(W - 1, Math.floor((ev.clientX - r.left) / r.width * W));
+  const y = Math.min(H - 1, Math.floor((ev.clientY - r.top) / r.height * H));
+  heights[y * W + x] += GRAINS_PER_TAP;
+  hint.style.opacity = 0;
+  if (label === '') run(`+${GRAINS_PER_TAP}`, null);
+}
+
+canvas.addEventListener('pointerdown', pour);
+document.getElementById('identity').addEventListener('click', startIdentity);
+document.getElementById('pile').addEventListener('click', startPile);
+
+fitGrid();
+if (params.get('m') === 'pila') startPile(); else startIdentity();
+requestAnimationFrame(frame);
+setTimeout(() => { hint.style.opacity = 0; }, 6000);
+</script>
+</body>
+</html>
